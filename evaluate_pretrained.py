@@ -1,476 +1,438 @@
-
-#!!/usr/bin/env python3
+#!/usr/bin/env python3
 """
-Evaluation script for pretrained models
-Compatible with both TransformerQA and TransformerQAWithMLM
+MLM Pretraining script for Transformer model
+Pretrains on WikiText-103 with masked language modeling
 """
-import argparse, json, math, os, sys, re
-from collections import defaultdict
-from typing import Dict, List, Tuple, Optional
-
+import os
+import math
+import random
 import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer
 from tqdm import tqdm
+import numpy as np
+from pathlib import Path
+import pandas as pd
+import pyarrow.parquet as pq
 
-from transformers import AutoTokenizer, PreTrainedTokenizerFast
+from transformer_qa_mlm import TransformerQAWithMLM
 
-# ---------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def normalize_text(s: str) -> str:
-    """SQuAD-style text normalization for EM/F1."""
-    def remove_articles(text): return re.sub(r"\b(a|an|the)\b", " ", text)
-    def white_space_fix(text): return " ".join(text.split())
-    def remove_punc(text): return re.sub(r"[^\w\s]", "", text)
-    def lower(text): return text.lower()
-    return white_space_fix(remove_articles(remove_punc(lower(s))))
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-def f1_score(prediction: str, ground_truth: str) -> float:
-    pred_tokens = normalize_text(prediction).split()
-    gold_tokens = normalize_text(ground_truth).split()
-    if len(pred_tokens) == 0 and len(gold_tokens) == 0:
-        return 1.0
-    if len(pred_tokens) == 0 or len(gold_tokens) == 0:
-        return 0.0
-    common = {}
-    for t in pred_tokens:
-        common[t] = min(pred_tokens.count(t), gold_tokens.count(t))
-    num_same = sum(common.values())
-    if num_same == 0:
-        return 0.0
-    precision = 1.0 * num_same / len(pred_tokens)
-    recall = 1.0 * num_same / len(gold_tokens)
-    return (2 * precision * recall) / (precision + recall)
-
-def exact_match_score(prediction: str, ground_truth: str) -> bool:
-    return normalize_text(prediction) == normalize_text(ground_truth)
-
-# ---------------------------------------------------------------------
-# Data: minimal SQuADv2 windowed dataset with offsets
-# ---------------------------------------------------------------------
-
-class SQuADWindowDataset(Dataset):
-    """
-    Creates overlapping windows per (question, paragraph) with offset mapping
-    so we can map token spans back to character substrings.
-    """
-    def __init__(self,
-                 data_path: str,
-                 tokenizer: PreTrainedTokenizerFast,
-                 max_len: int = 384,
-                 stride: int = 128):
-        super().__init__()
+class WikiTextDataset(Dataset):
+    """Dataset for MLM pretraining on WikiText."""
+    def __init__(self, file_paths, tokenizer, max_len=384, mlm_probability=0.15, max_examples=100000):
         self.tokenizer = tokenizer
         self.max_len = max_len
-        self.stride = stride
-
-        with open(data_path, "r", encoding="utf-8") as f:
-            js = json.load(f)
-
-        self.examples = []  # list of dicts, each is one window
-        for article in tqdm(js["data"], desc="Building windows"):
-            for para in article["paragraphs"]:
-                context = para["context"]
-                for qa in para["qas"]:
-                    qid = qa["id"]
-                    question = qa["question"]
-                    answers = [a["text"] for a in qa.get("answers", [])]
-
-                    enc = self.tokenizer(
-                        question,
-                        context,
-                        truncation="only_second",
-                        max_length=self.max_len,
-                        stride=self.stride,
-                        return_overflowing_tokens=True,
-                        return_offsets_mapping=True,
-                        padding="max_length",
-                        return_token_type_ids=True,
-                    )
-
-                    for i in range(len(enc["input_ids"])):
-                        input_ids = enc["input_ids"][i]
-                        attention_mask = enc["attention_mask"][i]
-                        token_type_ids = enc["token_type_ids"][i]
-                        offsets = enc["offset_mapping"][i]  # list of (char_start, char_end)
-                        self.examples.append({
-                            "qid": qid,
-                            "question": question,
-                            "context": context,
-                            "answers": answers,
-                            "input_ids": input_ids,
-                            "attention_mask": attention_mask,
-                            "token_type_ids": token_type_ids,
-                            "offsets": offsets,
-                        })
+        self.mlm_probability = mlm_probability
+        self.examples = []
+        
+        # Handle both single file and list of files
+        if isinstance(file_paths, str):
+            file_paths = [file_paths]
+        
+        print(f"Loading data from {len(file_paths)} file(s)...")
+        
+        all_texts = []
+        for file_path in file_paths:
+            if file_path.endswith('.parquet'):
+                # Read Parquet file
+                df = pd.read_parquet(file_path)
+                # WikiText parquet files usually have a 'text' column
+                texts = df['text'].tolist()
+                all_texts.extend(texts)
+            else:
+                # Read raw text file (fallback)
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+                all_texts.append(text)
+        
+        # Process all texts
+        print("Tokenizing and creating examples...")
+        current_tokens = []
+        
+        for text in tqdm(all_texts, desc="Processing texts"):
+            if not text or not text.strip():
+                continue
+            
+            # Split text into sentences/paragraphs
+            lines = text.split('\n') if '\n' in text else [text]
+            
+            for line in lines:
+                line = line.strip()
+                if not line or line.startswith('='):  # Skip empty lines and headers
+                    continue
+                
+                tokens = tokenizer.tokenize(line)
+                current_tokens.extend(tokens)
+                
+                # Create examples when we have enough tokens
+                while len(current_tokens) >= max_len - 2:  # -2 for [CLS] and [SEP]
+                    example_tokens = current_tokens[:max_len-2]
+                    current_tokens = current_tokens[max_len-2:]
+                    
+                    # Convert to input_ids
+                    input_ids = tokenizer.convert_tokens_to_ids(['[CLS]'] + example_tokens + ['[SEP]'])
+                    input_ids += [tokenizer.pad_token_id] * (max_len - len(input_ids))
+                    
+                    self.examples.append(input_ids)
+                    
+                    # Limit dataset size for faster training
+                    if len(self.examples) >= max_examples:
+                        break
+                
+                if len(self.examples) >= max_examples:
+                    break
+            
+            if len(self.examples) >= max_examples:
+                break
+        
+        print(f"Created {len(self.examples)} training examples")
+        
+        # Special tokens
+        self.mask_token_id = tokenizer.mask_token_id
+        self.pad_token_id = tokenizer.pad_token_id
+        self.cls_token_id = tokenizer.cls_token_id
+        self.sep_token_id = tokenizer.sep_token_id
+        self.vocab_size = tokenizer.vocab_size
 
     def __len__(self):
         return len(self.examples)
-
-    def __getitem__(self, idx: int):
-        ex = self.examples[idx]
-        return (
-            ex["qid"],
-            torch.tensor(ex["input_ids"], dtype=torch.long),
-            torch.tensor(ex["attention_mask"], dtype=torch.long),
-            torch.tensor(ex["token_type_ids"], dtype=torch.long),
-            ex["offsets"],
-            ex["context"],
-            ex["answers"],
-        )
-
-# ---------------------------------------------------------------------
-# Model loader: supports both architectures
-# ---------------------------------------------------------------------
-
-def build_model_from_ckpt(ckpt_path: str, vocab_size: int):
-    """
-    Reads checkpoint and builds appropriate model.
-    Supports both TransformerQA and TransformerQAWithMLM.
-    """
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-
-    # Accept both full dict and raw state_dict
-    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        state_dict = ckpt["model_state_dict"]
-        cfg = ckpt.get("config", {})
-        is_pretrained = ckpt.get("pretrained", False)
-    else:
-        state_dict = ckpt
-        cfg = {}
-        is_pretrained = False
-
-    d_model = int(cfg.get("d_model", 256))
-    n_heads = int(cfg.get("n_heads", 8))
-    n_layers = int(cfg.get("n_layers", 4))
-    d_ff = int(cfg.get("d_ff", 1024))
-    dropout = float(cfg.get("dropout", 0.1))
-    max_len = int(cfg.get("max_len", 384))
     
-    print(f"[MODEL CONFIG] d_model={d_model}  n_heads={n_heads}  n_layers={n_layers}  d_ff={d_ff}  dropout={dropout}  max_len={max_len}")
+    def __getitem__(self, idx):
+        input_ids = self.examples[idx].copy()
+        
+        # Create MLM labels
+        labels = [-100] * len(input_ids)  # -100 = ignore in loss
+        
+        # Random masking
+        for i in range(1, len(input_ids) - 1):  # Skip [CLS] and [SEP]
+            if input_ids[i] == self.pad_token_id:
+                continue
+                
+            if random.random() < self.mlm_probability:
+                labels[i] = input_ids[i]  # Save true label
+                
+                # 80% mask, 10% random, 10% unchanged
+                rand = random.random()
+                if rand < 0.8:
+                    input_ids[i] = self.mask_token_id
+                elif rand < 0.9:
+                    input_ids[i] = random.randint(0, self.vocab_size - 1)
+                # else: keep unchanged
+        
+        # Create attention mask
+        attention_mask = [1 if id != self.pad_token_id else 0 for id in input_ids]
+        
+        return {
+            'input_ids': torch.tensor(input_ids, dtype=torch.long),
+            'attention_mask': torch.tensor(attention_mask, dtype=torch.long),
+            'mlm_labels': torch.tensor(labels, dtype=torch.long)
+        }
+
+def pretrain_mlm():
+    """Main MLM pretraining function."""
+    set_seed(42)
     
-    if is_pretrained:
-        print("[INFO] Loading PRETRAINED model (with MLM pretraining)")
-    else:
-        print("[INFO] Loading standard model (no pretraining)")
+    # Configuration
+    CONFIG = {
+        # Data - Updated for Parquet files
+        'train_files': [
+            'wikitext-103-raw-v1/train-00000-of-00002.parquet',
+            'wikitext-103-raw-v1/train-00001-of-00002.parquet'
+        ],
+        'val_file': 'wikitext-103-raw-v1/validation-00000-of-00001.parquet',
+        'max_len': 384,
+        'mlm_probability': 0.15,
+        'max_examples': 500000,  # Limit examples for faster training
+        
+        # Model (same architecture as fine-tuning)
+        'd_model': 320,
+        'n_heads': 10,
+        'n_layers': 5,
+        'd_ff': 1280,
+        'dropout': 0.1,  # Lower dropout for pretraining
+        
+        # Training
+        'batch_size': 16,
+        'accumulation_steps': 2,
+        'epochs': 10,  # Can increase for better pretraining
+        'lr': 5e-4,  # Higher LR for pretraining
+        'warmup_ratio': 0.1,
+        'weight_decay': 0.01,
+        'gradient_clip': 1.0,
+        
+        # Early stopping
+        'patience': 2,
+        'min_delta': 0.01,
+    }
     
-    # Check if this is a pretrained model by looking for MLM weights
-    has_mlm = any('mlm_' in k for k in state_dict.keys())
-    
-    if has_mlm or is_pretrained:
-        # Use the MLM model architecture
-        from transformer_qa_mlm import TransformerQAWithMLM
-        model = TransformerQAWithMLM(
-            vocab_size=vocab_size,
-            d_model=d_model,
-            n_heads=n_heads,
-            n_layers=n_layers,
-            d_ff=d_ff,
-            max_len=max_len,
-            dropout=dropout,
-        )
-    else:
-        # Use the standard model architecture
-        from transformer_qa import TransformerQA
-        model = TransformerQA(
-            vocab_size=vocab_size,
-            d_model=d_model,
-            n_heads=n_heads,
-            n_layers=n_layers,
-            d_ff=d_ff,
-            max_len=max_len,
-            dropout=dropout,
-        )
-    
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing or unexpected:
-        print(f"[WARN] Non-strict load: missing={len(missing)} unexpected={len(unexpected)}")
-        if len(missing) < 50 and (missing or unexpected):
-            print(" missing:", missing[:10])
-            print(" unexpected:", unexpected[:10])
-    
-    model.to(DEVICE)
-    model.eval()
-    return model, max_len, is_pretrained
-
-# ---------------------------------------------------------------------
-# Scoring / span extraction
-# ---------------------------------------------------------------------
-
-def get_best_span_from_window(start_logits: torch.Tensor,
-                              end_logits: torch.Tensor,
-                              token_type_ids: torch.Tensor,
-                              offsets: List[Tuple[int, int]],
-                              max_answer_len: int = 30) -> Tuple[float, Tuple[int,int]]:
-    """
-    Returns best span score and (start_idx, end_idx) *token indices* within this window.
-    Restrict to context tokens where token_type_ids == 1.
-    """
-    # Mask to context tokens
-    tt = token_type_ids.bool()
-    s = start_logits.clone()
-    e = end_logits.clone()
-    s[~tt] = -1e9
-    e[~tt] = -1e9
-
-    # Outer sum to get span scores (start<=end and length<=max_answer_len)
-    L = s.size(0)
-    span_scores = s[:, None] + e[None, :]
-    tri_mask = torch.triu(torch.ones((L, L), device=span_scores.device), diagonal=0)
-    len_mask = torch.tril(torch.ones((L, L), device=span_scores.device), diagonal=max_answer_len-1)
-    valid = (tri_mask * len_mask).bool()
-    span_scores[~valid] = -1e9
-
-    # Also block CLS token (index 0) as a span token
-    span_scores[0, :] = -1e9
-    span_scores[:, 0] = -1e9
-
-    flat_idx = torch.argmax(span_scores).item()
-    i = flat_idx // L
-    j = flat_idx % L
-    best_score = span_scores[i, j].item()
-    return best_score, (i, j)
-
-def span_to_text(context: str, offsets: List[Tuple[int,int]], start_idx: int, end_idx: int) -> str:
-    char_start = offsets[start_idx][0]
-    char_end   = offsets[end_idx][1]
-    if char_start is None or char_end is None:
-        return ""
-    char_start = max(0, char_start)
-    char_end = max(char_start, char_end)
-    return context[char_start:char_end]
-
-# ---------------------------------------------------------------------
-# Evaluation pass
-# ---------------------------------------------------------------------
-
-def collect_candidates(model,
-                       data_loader: DataLoader,
-                       max_answer_len: int = 30,
-                       window_batch_size: int = 16,
-                       is_mlm_model: bool = False):
-    """
-    One forward pass over all windows; aggregate best span per question (and null scores).
-    """
-    per_q_best: Dict[str, Tuple[float, str]] = {}
-    per_q_null: Dict[str, float] = defaultdict(lambda: -1e9)
-    golds: Dict[str, List[str]] = {}
-
-    with torch.no_grad():
-        buf = []
-        meta = []
-
-        def flush():
-            nonlocal buf, meta
-            if not buf: return
-            input_ids = torch.stack([b[0] for b in buf]).to(DEVICE)
-            attn      = torch.stack([b[1] for b in buf]).to(DEVICE)
-            ttids     = torch.stack([b[2] for b in buf]).to(DEVICE)
-
-            if is_mlm_model:
-                # MLM model needs return_mlm=False for QA
-                start_logits, end_logits = model(input_ids, attn, ttids, return_mlm=False)
-            else:
-                start_logits, end_logits = model(input_ids, attn, ttids)
-            
-            start_logits = start_logits.float().cpu()
-            end_logits   = end_logits.float().cpu()
-            ttids_cpu    = ttids.cpu()
-
-            for k in range(start_logits.size(0)):
-                qid, offsets, context, answers = meta[k]
-                # null score as CLS start+end
-                null_score = (start_logits[k, 0] + end_logits[k, 0]).item()
-                if null_score > per_q_null[qid]:
-                    per_q_null[qid] = null_score
-                # best span within window
-                score, (si, ei) = get_best_span_from_window(
-                    start_logits[k], end_logits[k], ttids_cpu[k], offsets, max_answer_len
-                )
-                text = span_to_text(context, offsets, si, ei)
-                prev = per_q_best.get(qid, (-1e9, ""))
-                if score > prev[0]:
-                    per_q_best[qid] = (score, text)
-                if qid not in golds:
-                    golds[qid] = answers
-
-            buf = []
-            meta = []
-
-        for batch in tqdm(data_loader, desc="Collecting windows"):
-            # each batch item: (qid, input_ids, attention_mask, token_type_ids, offsets, context, answers)
-            for i in range(len(batch[0])):
-                qid = batch[0][i]
-                input_ids = batch[1][i]
-                attn = batch[2][i]
-                ttids = batch[3][i]
-                offsets = batch[4][i]
-                context = batch[5][i]
-                answers = batch[6][i]
-                buf.append((input_ids, attn, ttids))
-                meta.append((qid, offsets, context, answers))
-                if len(buf) == window_batch_size:
-                    flush()
-        flush()
-    return per_q_best, per_q_null, golds
-
-def evaluate_grid(per_q_best, per_q_null, golds,
-                  thr_start: float, thr_end: float, thr_step: float) -> Tuple[float, float, float, float, float, float]:
-    """
-    Try thresholds on (best_span_score - null_score). If < threshold, predict empty.
-    Returns best (F1, EM, has_f1, has_em, no_em, threshold).
-    """
-    qids = list(golds.keys())
-    best = (-1.0, -1.0, -1.0, -1.0, -1.0, 0.0)
-
-    thr = thr_start
-    while thr <= thr_end + 1e-9:
-        preds = {}
-        for qid in qids:
-            span_score, text = per_q_best.get(qid, (-1e9, ""))
-            null_score = per_q_null.get(qid, -1e9)
-            margin = span_score - null_score
-            if margin >= thr and text.strip():
-                preds[qid] = text
-            else:
-                preds[qid] = ""  # predict null
-        f1, em, has_f1, has_em, no_em = compute_metrics(preds, golds)
-        if f1 > best[0]:
-            best = (f1, em, has_f1, has_em, no_em, thr)
-        thr += thr_step
-    
-    print(f"[TUNED] best_null_threshold={best[5]:.2f}  F1={best[0]*100:.2f}%  EM={best[1]*100:.2f}%")
-    return best
-
-def compute_metrics(preds: Dict[str,str], golds: Dict[str, List[str]]):
-    n_all = len(golds)
-    n_has = 0
-    n_no  = 0
-    f1_sum = 0.0
-    em_sum = 0.0
-    has_f1 = has_em = 0.0
-    no_em  = 0.0
-
-    for qid, answers in golds.items():
-        is_has = len(answers) > 0 and any(a.strip() for a in answers)
-        if is_has: n_has += 1
-        else: n_no += 1
-        pred = preds.get(qid, "")
-        # pick max over references
-        f1 = max((f1_score(pred, a) for a in answers), default=1.0 if pred=="" else 0.0)
-        em = max((1.0 if exact_match_score(pred, a) else 0.0 for a in answers), default=1.0 if pred=="" else 0.0)
-        f1_sum += f1
-        em_sum += em
-        if is_has:
-            has_f1 += f1
-            has_em += em
-        else:
-            no_em += 1.0 if pred == "" else 0.0
-
-    f1 = f1_sum / max(1, n_all)
-    em = em_sum / max(1, n_all)
-    has_f1 = has_f1 / max(1, n_has)
-    has_em = has_em / max(1, n_has)
-    no_em = no_em / max(1, n_no)
-    return f1, em, has_f1, has_em, no_em
-
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
-
-def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True, help="Path to .pth checkpoint")
-    ap.add_argument("--data", required=True, help="SQuAD v2.0 dev file (json)")
-    ap.add_argument("--tok_dir", required=True, help="Tokenizer dir (e.g., ./bert-base-uncased)")
-    ap.add_argument("--window_batch_size", type=int, default=16)
-    ap.add_argument("--max_answer_length", type=int, default=30)
-    ap.add_argument("--tune_threshold", action="store_true")
-    ap.add_argument("--thr_start", type=float, default=-2.0)
-    ap.add_argument("--thr_end", type=float, default=8.0)
-    ap.add_argument("--thr_step", type=float, default=0.25)
-    ap.add_argument("--max_len", type=int, default=None, help="Override max_len for windowing")
-    ap.add_argument("--stride", type=int, default=128)
-    return ap.parse_args()
-
-def main():
-    args = parse_args()
     print("="*70)
-    print("EVALUATION FOR PRETRAINED MODELS")
+    print("MLM PRETRAINING")
     print("="*70)
-    print(f"Model: {args.model}")
     print(f"Device: {DEVICE}")
+    print("\nConfiguration:")
+    for k, v in CONFIG.items():
+        if k not in ['train_files']:  # Don't print the long file list
+            print(f"  {k}: {v}")
+    print(f"  train_files: {len(CONFIG['train_files'])} files")
+    print("="*70)
     
-    print("\nLoading model...")
-    tokenizer = AutoTokenizer.from_pretrained(args.tok_dir, use_fast=True, local_files_only=True)
-    model, cfg_max_len, is_pretrained = build_model_from_ckpt(args.model, tokenizer.vocab_size)
+    # Initialize tokenizer
+    print("\n[1/5] Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained('./bert-base-uncased', local_files_only=True)
     
-    # Check if this is an MLM model
-    is_mlm_model = hasattr(model, 'mlm_output')
+    # Check if WikiText exists (check for first training file)
+    if not Path(CONFIG['train_files'][0]).exists():
+        print(f"\n⚠️  WikiText-103 not found at {CONFIG['train_files'][0]}")
+        print("\nPlease ensure your parquet files are in the correct location.")
+        print("Expected structure:")
+        print("  wikitext-103-raw-v1/")
+        print("    ├── train-00000-of-00002.parquet")
+        print("    ├── train-00001-of-00002.parquet")
+        print("    └── validation-00000-of-00001.parquet")
+        return None
     
-    if is_pretrained:
-        print("\n🚀 This model was PRETRAINED with MLM!")
-        print("   Expecting significantly better performance than non-pretrained models.")
-    
-    max_len = args.max_len if args.max_len is not None else cfg_max_len
-    print(f"\nUsing max_len={max_len} stride={args.stride}")
-
-    print("\nPreparing evaluation dataset...")
-    ds = SQuADWindowDataset(args.data, tokenizer, max_len=max_len, stride=args.stride)
-    dl = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0, pin_memory=False, 
-                    collate_fn=lambda x: list(zip(*x)))
-
-    print("\nCollecting per-question candidates (one model pass)...")
-    per_q_best, per_q_null, golds = collect_candidates(
-        model, dl, max_answer_len=args.max_answer_length, 
-        window_batch_size=args.window_batch_size, is_mlm_model=is_mlm_model
+    # Load datasets
+    print("\n[2/5] Loading datasets...")
+    print("Loading training data...")
+    train_dataset = WikiTextDataset(
+        CONFIG['train_files'],
+        tokenizer,
+        max_len=CONFIG['max_len'],
+        mlm_probability=CONFIG['mlm_probability'],
+        max_examples=CONFIG['max_examples']
     )
-
-    if args.tune_threshold:
-        print(f"\nTuning null threshold from {args.thr_start} to {args.thr_end} step {args.thr_step} ...")
-        f1, em, has_f1, has_em, no_em, best_thr = evaluate_grid(
-            per_q_best, per_q_null, golds, args.thr_start, args.thr_end, args.thr_step
-        )
-        # Use best threshold for final predictions
-        final_thr = best_thr
-    else:
-        # default thr=0
-        final_thr = 0.0
-        preds = {}
-        for qid, (span_score, text) in per_q_best.items():
-            null_score = per_q_null.get(qid, -1e9)
-            preds[qid] = text if (span_score - null_score) >= final_thr and text.strip() else ""
-        f1, em, has_f1, has_em, no_em = compute_metrics(preds, golds)
-
+    
+    print("Loading validation data...")
+    val_dataset = WikiTextDataset(
+        CONFIG['val_file'],
+        tokenizer,
+        max_len=CONFIG['max_len'],
+        mlm_probability=CONFIG['mlm_probability'],
+        max_examples=20000  # Smaller validation set
+    )
+    
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=CONFIG['batch_size'],
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=CONFIG['batch_size'] * 2,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True
+    )
+    
+    # Initialize model
+    print("\n[3/5] Initializing model...")
+    model = TransformerQAWithMLM(
+        vocab_size=tokenizer.vocab_size,
+        d_model=CONFIG['d_model'],
+        n_heads=CONFIG['n_heads'],
+        n_layers=CONFIG['n_layers'],
+        d_ff=CONFIG['d_ff'],
+        max_len=CONFIG['max_len'],
+        dropout=CONFIG['dropout']
+    ).to(DEVICE)
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  Model size: {total_params * 4 / 1024 / 1024:.2f} MB")
+    
+    # Optimizer
+    print("\n[4/5] Setting up optimizer and scheduler...")
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=CONFIG['lr'],
+        weight_decay=CONFIG['weight_decay'],
+        betas=(0.9, 0.999),
+        eps=1e-8
+    )
+    
+    # Cosine scheduler with warmup
+    total_steps = len(train_loader) * CONFIG['epochs'] // CONFIG['accumulation_steps']
+    warmup_steps = int(total_steps * CONFIG['warmup_ratio'])
+    
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
+    # Mixed precision scaler
+    scaler = torch.cuda.amp.GradScaler()
+    
+    # Training metrics
+    best_val_loss = float('inf')
+    best_model_state = None
+    patience_counter = 0
+    
+    print("\n[5/5] Starting MLM pretraining...")
+    print("="*70)
+    
+    for epoch in range(1, CONFIG['epochs'] + 1):
+        # Training phase
+        model.train()
+        total_loss = 0
+        total_acc = 0
+        total_masked = 0
+        optimizer.zero_grad()
+        
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{CONFIG['epochs']}")
+        
+        for step, batch in enumerate(pbar):
+            input_ids = batch['input_ids'].to(DEVICE)
+            attention_mask = batch['attention_mask'].to(DEVICE)
+            mlm_labels = batch['mlm_labels'].to(DEVICE)
+            
+            # Mixed precision forward pass
+            with torch.cuda.amp.autocast():
+                loss, logits = model(
+                    input_ids, 
+                    attention_mask=attention_mask,
+                    mlm_labels=mlm_labels,
+                    return_mlm=True
+                )
+                loss = loss / CONFIG['accumulation_steps']
+            
+            # Calculate accuracy on masked tokens
+            with torch.no_grad():
+                mask = (mlm_labels != -100)
+                if mask.sum() > 0:
+                    predictions = logits[mask].argmax(dim=-1)
+                    correct = (predictions == mlm_labels[mask]).sum().item()
+                    total_acc += correct
+                    total_masked += mask.sum().item()
+            
+            # Backward pass
+            scaler.scale(loss).backward()
+            
+            # Gradient accumulation
+            if (step + 1) % CONFIG['accumulation_steps'] == 0:
+                # Gradient clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['gradient_clip'])
+                
+                # Optimizer step
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
+            
+            total_loss += loss.item() * CONFIG['accumulation_steps']
+            
+            # Update progress bar
+            current_lr = scheduler.get_last_lr()[0]
+            acc = (total_acc / max(1, total_masked)) * 100
+            pbar.set_postfix({
+                'loss': f"{loss.item() * CONFIG['accumulation_steps']:.4f}",
+                'acc': f"{acc:.1f}%",
+                'lr': f"{current_lr:.2e}"
+            })
+        
+        avg_train_loss = total_loss / len(train_loader)
+        train_acc = (total_acc / max(1, total_masked)) * 100
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0
+        val_acc = 0
+        val_masked = 0
+        
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="Validating", leave=False):
+                input_ids = batch['input_ids'].to(DEVICE)
+                attention_mask = batch['attention_mask'].to(DEVICE)
+                mlm_labels = batch['mlm_labels'].to(DEVICE)
+                
+                loss, logits = model(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    mlm_labels=mlm_labels,
+                    return_mlm=True
+                )
+                
+                val_loss += loss.item()
+                
+                # Calculate accuracy
+                mask = (mlm_labels != -100)
+                if mask.sum() > 0:
+                    predictions = logits[mask].argmax(dim=-1)
+                    correct = (predictions == mlm_labels[mask]).sum().item()
+                    val_acc += correct
+                    val_masked += mask.sum().item()
+        
+        avg_val_loss = val_loss / len(val_loader)
+        val_accuracy = (val_acc / max(1, val_masked)) * 100
+        
+        # Print epoch results
+        print(f"\nEpoch {epoch}:")
+        print(f"  Train Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.2f}%")
+        print(f"  Val Loss: {avg_val_loss:.4f}, Val Acc: {val_accuracy:.2f}%")
+        
+        # Save best model
+        if avg_val_loss < best_val_loss - CONFIG['min_delta']:
+            best_val_loss = avg_val_loss
+            best_model_state = model.state_dict().copy()
+            print(f"  ✓ New best model (val_loss: {best_val_loss:.4f})")
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= CONFIG['patience']:
+                print(f"\n⚠ Early stopping triggered at epoch {epoch}")
+                break
+    
+    # Load best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print(f"\n✓ Loaded best model checkpoint (val_loss: {best_val_loss:.4f})")
+    
+    # Save pretrained model
+    print("\nSaving pretrained model...")
+    os.makedirs('pretrained', exist_ok=True)
+    
+    # Save full model
+    model_path = 'pretrained/mlm_pretrained_model.pth'
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'encoder_state_dict': model.get_encoder_state_dict(),
+        'config': CONFIG,
+        'vocab_size': tokenizer.vocab_size,
+        'best_val_loss': best_val_loss
+    }, model_path)
+    
+    print(f"✓ Pretrained model saved to: {model_path}")
+    
+    # Print summary
     print("\n" + "="*70)
-    print("EVALUATION RESULTS" + (" (PRETRAINED MODEL)" if is_pretrained else ""))
+    print("PRETRAINING COMPLETE")
     print("="*70)
-    print(f"Overall F1 Score: {f1*100:.2f}%")
-    print(f"Overall Exact Match: {em*100:.2f}%")
-    print("-"*70)
-    print(f"HasAns F1: {has_f1*100:.2f}%" + (" 🎯" if has_f1 > 0.3 else ""))
-    print(f"HasAns EM: {has_em*100:.2f}%")
-    print(f"NoAns EM:  {no_em*100:.2f}%")
+    print(f"Best validation loss: {best_val_loss:.4f}")
+    print(f"Best validation accuracy: {val_accuracy:.2f}%")
+    print("\nNext step: Run fine-tuning on SQuAD")
+    print("python train_finetune.py")
     print("="*70)
     
-    if is_pretrained and has_f1 > 0.2:
-        print("\n✨ PRETRAINING SUCCESS! The MLM pretraining significantly")
-        print("   improved the HasAns F1 score compared to non-pretrained models.")
-    
-    # Save predictions
-    preds = {}
-    for qid, (span_score, text) in per_q_best.items():
-        null_score = per_q_null.get(qid, -1e9)
-        preds[qid] = text if (span_score - null_score) >= final_thr and text.strip() else ""
-    
-    with open("predictions_pretrained.json", "w", encoding="utf-8") as f:
-        json.dump(preds, f, ensure_ascii=False, indent=2)
-    print("\nPredictions saved to predictions_pretrained.json")
+    return model_path
 
 if __name__ == "__main__":
-
-    main()
+    pretrain_mlm()
