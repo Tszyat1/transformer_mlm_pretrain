@@ -1,4 +1,5 @@
-#!/usr/bin/env python3
+
+#!!/usr/bin/env python3
 """
 Evaluation script for pretrained models
 Compatible with both TransformerQA and TransformerQAWithMLM
@@ -471,4 +472,5 @@ def main():
     print("\nPredictions saved to predictions_pretrained.json")
 
 if __name__ == "__main__":
+
     main()
