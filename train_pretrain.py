@@ -19,6 +19,8 @@ import pyarrow.parquet as pq
 
 from transformer_qa_mlm import TransformerQAWithMLM
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def set_seed(seed=42):
@@ -152,7 +154,7 @@ def pretrain_mlm():
         'val_file': 'wikitext-103-raw-v1/validation-00000-of-00001.parquet',
         'max_len': 384,
         'mlm_probability': 0.15,
-        'max_examples': 100000,  # Limit examples for faster training
+        'max_examples': 500000,  # Limit examples for faster training
         
         # Model (same architecture as fine-tuning)
         'd_model': 320,
@@ -164,7 +166,7 @@ def pretrain_mlm():
         # Training
         'batch_size': 16,
         'accumulation_steps': 2,
-        'epochs': 3,  # Can increase for better pretraining
+        'epochs': 10,  # Can increase for better pretraining
         'lr': 5e-4,  # Higher LR for pretraining
         'warmup_ratio': 0.1,
         'weight_decay': 0.01,
