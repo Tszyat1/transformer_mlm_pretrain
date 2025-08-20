@@ -19,6 +19,8 @@ from pathlib import Path
 from transformer_qa_mlm import TransformerQAWithMLM
 from train import SQuADDataset  # Reuse the dataset from train.py
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class EarlyStopping:
@@ -77,7 +79,7 @@ def finetune_on_squad():
         # Training parameters (same as train_final.py)
         'batch_size': 10,
         'accumulation_steps': 2,
-        'epochs': 12,
+        'epochs': 20,
         'lr': 1.2e-4,  # Same LR as non-pretrained
         'warmup_ratio': 0.08,
         'weight_decay': 0.01,
@@ -90,7 +92,7 @@ def finetune_on_squad():
         'neg_weight': 0.9,
         
         # Early stopping
-        'patience': 3,
+        'patience': 8,
         'min_delta': 0.001,
         
         # Pretrained model path
